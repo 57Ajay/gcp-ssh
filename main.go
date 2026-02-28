@@ -20,11 +20,13 @@ type Config struct {
 
 // Instance holds GCP instance details
 type Instance struct {
-	Alias    string `json:"alias"`
-	Project  string `json:"project"`
-	Zone     string `json:"zone"`
-	Name     string `json:"name"`
-	AuthUser int    `json:"authuser"`
+	Alias          string `json:"alias"`
+	Project        string `json:"project"`
+	Zone           string `json:"zone"`
+	Name           string `json:"name"`
+	AuthUser       int    `json:"authuser"`
+	GcloudAccount  string `json:"gcloud_account,omitempty"`
+	ConnectionMode string `json:"connection_mode,omitempty"` // browser or terminal
 }
 
 func main() {
@@ -82,10 +84,16 @@ func handleArgs(args []string, config *Config, configPath string) {
 			fmt.Println("Usage: gcp-ssh connect <alias>")
 			return
 		}
-		connectByAlias(config, args[1])
+		connectByAlias(config, args[1], "")
+	case "connect-terminal":
+		if len(args) < 2 {
+			fmt.Println("Usage: gcp-ssh connect-terminal <alias>")
+			return
+		}
+		connectByAlias(config, args[1], "terminal")
 	case "quick":
 		if len(args) < 4 {
-			fmt.Println("Usage: gcp-ssh quick <project> <zone> <instance-name>")
+			fmt.Println("Usage: gcp-ssh quick <project> <zone> <instance-name> [gcloud-account-email]")
 			return
 		}
 		inst := Instance{
@@ -94,14 +102,27 @@ func handleArgs(args []string, config *Config, configPath string) {
 			Name:     args[3],
 			AuthUser: 0,
 		}
+		if len(args) > 4 {
+			inst.GcloudAccount = args[4]
+		}
 		openSSH(config, inst)
+	case "quick-terminal":
+		if len(args) < 4 {
+			fmt.Println("Usage: gcp-ssh quick-terminal <project> <zone> <instance-name> [gcloud-account-email]")
+			return
+		}
+		inst := Instance{Project: args[1], Zone: args[2], Name: args[3], AuthUser: 0, ConnectionMode: "terminal"}
+		if len(args) > 4 {
+			inst.GcloudAccount = args[4]
+		}
+		connectTerminal(inst)
 	case "profile":
 		setChromeProfile(config, configPath)
 	case "help":
 		printHelp()
 	default:
 		// Try treating first arg as an alias
-		connectByAlias(config, args[0])
+		connectByAlias(config, args[0], "")
 	}
 }
 
@@ -147,16 +168,16 @@ func interactiveMode(config *Config, configPath string) {
 			input := readLine(reader)
 			// Try as number first
 			if num, err := strconv.Atoi(input); err == nil && num >= 1 && num <= len(config.Instances) {
-				openSSH(config, config.Instances[num-1])
+				openByMode(config, config.Instances[num-1])
 			} else {
-				connectByAlias(config, input)
+				connectByAlias(config, input, "")
 			}
 			fmt.Println()
 
 		case "2":
 			fmt.Println()
 			inst := promptInstanceDetails(reader)
-			openSSH(config, inst)
+			openByMode(config, inst)
 			fmt.Println()
 
 			fmt.Print("  Save this instance for later? (y/n): ")
@@ -211,12 +232,21 @@ func promptInstanceDetails(reader *bufio.Reader) Instance {
 	inst.Zone = readLine(reader)
 	fmt.Print("  Instance Name: ")
 	inst.Name = readLine(reader)
-	fmt.Print("  Auth User index (0 for default, 1 for second account, etc.) [0]: ")
+	fmt.Print("  Auth User index for browser URL (0 default, 1 second account, etc.) [0]: ")
 	authStr := readLine(reader)
 	if authStr == "" {
 		inst.AuthUser = 0
 	} else {
 		inst.AuthUser, _ = strconv.Atoi(authStr)
+	}
+	fmt.Print("  Google account email for gcloud (recommended): ")
+	inst.GcloudAccount = readLine(reader)
+	fmt.Print("  Preferred SSH mode [browser/terminal] (default browser): ")
+	mode := strings.ToLower(readLine(reader))
+	if mode == "terminal" {
+		inst.ConnectionMode = "terminal"
+	} else {
+		inst.ConnectionMode = "browser"
 	}
 	return inst
 }
@@ -260,20 +290,43 @@ func listInstances(config *Config) {
 	}
 	fmt.Println("  ┌─ Saved Instances:")
 	for i, inst := range config.Instances {
-		fmt.Printf("  │  %d) [%s] %s/%s/%s (authuser=%d)\n",
-			i+1, inst.Alias, inst.Project, inst.Zone, inst.Name, inst.AuthUser)
+		mode := inst.ConnectionMode
+		if mode == "" {
+			mode = "browser"
+		}
+		account := inst.GcloudAccount
+		if account == "" {
+			account = "(active gcloud account)"
+		}
+		fmt.Printf("  │  %d) [%s] %s/%s/%s (authuser=%d, mode=%s, account=%s)\n",
+			i+1, inst.Alias, inst.Project, inst.Zone, inst.Name, inst.AuthUser, mode, account)
 	}
 	fmt.Println("  └─")
 }
 
-func connectByAlias(config *Config, alias string) {
+func connectByAlias(config *Config, alias string, forcedMode string) {
 	for _, inst := range config.Instances {
 		if inst.Alias == alias {
-			openSSH(config, inst)
+			if forcedMode != "" {
+				inst.ConnectionMode = forcedMode
+			}
+			openByMode(config, inst)
 			return
 		}
 	}
 	fmt.Printf("  ✗ Alias '%s' not found. Use 'list' to see saved instances.\n", alias)
+}
+
+func openByMode(config *Config, inst Instance) {
+	mode := inst.ConnectionMode
+	if mode == "" {
+		mode = "browser"
+	}
+	if mode == "terminal" {
+		connectTerminal(inst)
+		return
+	}
+	openSSH(config, inst)
 }
 
 // ─── Chrome profile ──────────────────────────────────────────────────────────
@@ -354,10 +407,9 @@ func getProfileDisplayName(profilePath string) string {
 	return ""
 }
 
-// ─── SSH URL & Chrome launch ─────────────────────────────────────────────────
+// ─── SSH URL & launch ────────────────────────────────────────────────────────
 
 func buildSSHURL(inst Instance) string {
-	// Direct GCP SSH-in-browser URL
 	return fmt.Sprintf(
 		"https://ssh.cloud.google.com/projects/%s/zones/%s/instances/%s?authuser=%d&hl=en_US&projectNumber=0",
 		inst.Project, inst.Zone, inst.Name, inst.AuthUser,
@@ -365,6 +417,10 @@ func buildSSHURL(inst Instance) string {
 }
 
 func openSSH(config *Config, inst Instance) {
+	if !ensureInstanceReady(inst) {
+		fmt.Println("  ⚠ Instance readiness could not be verified with gcloud. Please start it manually if needed.")
+	}
+
 	url := buildSSHURL(inst)
 	chromePath := getChromeExecutable()
 
@@ -384,12 +440,9 @@ func openSSH(config *Config, inst Instance) {
 		profileDir = profileDir[:idx]
 	}
 
-	args := []string{
-		"--profile-directory=" + profileDir,
-		url,
-	}
+	args := []string{"--profile-directory=" + profileDir, url}
 
-	fmt.Printf("  🚀 Opening SSH for: %s (zone: %s, project: %s)\n", inst.Name, inst.Zone, inst.Project)
+	fmt.Printf("  🚀 Opening browser SSH for: %s (zone: %s, project: %s)\n", inst.Name, inst.Zone, inst.Project)
 	fmt.Printf("  🌐 URL: %s\n", url)
 	fmt.Printf("  🔑 Chrome profile: %s\n", profileDir)
 
@@ -405,6 +458,128 @@ func openSSH(config *Config, inst Instance) {
 	}
 
 	fmt.Println("  ✓ Chrome launched! SSH session will authenticate automatically.")
+}
+
+func connectTerminal(inst Instance) {
+	if !ensureInstanceReady(inst) {
+		fmt.Println("  ✗ Cannot continue with terminal SSH until gcloud is available and the instance is running.")
+		return
+	}
+
+	fmt.Printf("  🚀 Opening terminal SSH for: %s (zone: %s, project: %s)\n", inst.Name, inst.Zone, inst.Project)
+	cmd := exec.Command("gcloud", "compute", "ssh", inst.Name, "--project", inst.Project, "--zone", inst.Zone)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("  ✗ gcloud compute ssh failed: %v\n", err)
+	}
+}
+
+func ensureInstanceReady(inst Instance) bool {
+	if _, err := exec.LookPath("gcloud"); err != nil {
+		fmt.Println("  ⚠ gcloud CLI not found. Install gcloud or start the instance manually before SSH.")
+		return false
+	}
+
+	if !ensureGcloudAccount(inst.GcloudAccount) {
+		return false
+	}
+
+	if err := runGcloudCommand("config", "set", "project", inst.Project); err != nil {
+		fmt.Printf("  ✗ Failed to set active gcloud project: %v\n", err)
+		return false
+	}
+
+	status, err := runGcloudValueCommand("compute", "instances", "describe", inst.Name,
+		"--project", inst.Project,
+		"--zone", inst.Zone,
+		"--format=value(status)")
+	if err != nil {
+		fmt.Printf("  ✗ Failed to read instance status: %v\n", err)
+		return false
+	}
+
+	if strings.EqualFold(status, "RUNNING") {
+		fmt.Println("  ✓ Instance is already running.")
+		return true
+	}
+
+	fmt.Printf("  ℹ Instance status is '%s'. Starting instance...\n", status)
+	if err := runGcloudCommand("compute", "instances", "start", inst.Name,
+		"--project", inst.Project,
+		"--zone", inst.Zone); err != nil {
+		fmt.Printf("  ✗ Failed to start instance: %v\n", err)
+		return false
+	}
+
+	fmt.Println("  ✓ Instance started.")
+	return true
+}
+
+func ensureGcloudAccount(requiredAccount string) bool {
+	active, err := runGcloudValueCommand("auth", "list", "--filter=status:ACTIVE", "--format=value(account)")
+	if err != nil {
+		fmt.Printf("  ✗ Failed to determine active gcloud account: %v\n", err)
+		return false
+	}
+
+	if requiredAccount == "" {
+		if active == "" {
+			fmt.Println("  ⚠ No active gcloud account. Please run 'gcloud auth login' and retry.")
+			return false
+		}
+		fmt.Printf("  ✓ Using active gcloud account: %s\n", active)
+		return true
+	}
+
+	if active == requiredAccount {
+		fmt.Printf("  ✓ gcloud account matches configured account: %s\n", requiredAccount)
+		return true
+	}
+
+	fmt.Printf("  ℹ Active gcloud account is '%s', but '%s' is required.\n", active, requiredAccount)
+	accounts, err := runGcloudValueCommand("auth", "list", "--format=value(account)")
+	if err == nil {
+		for _, account := range strings.Split(accounts, "\n") {
+			if strings.TrimSpace(account) == requiredAccount {
+				fmt.Printf("  ℹ Switching gcloud account to '%s'...\n", requiredAccount)
+				if err := runGcloudCommand("config", "set", "account", requiredAccount); err != nil {
+					fmt.Printf("  ✗ Failed to set gcloud account: %v\n", err)
+					return false
+				}
+				return true
+			}
+		}
+	}
+
+	fmt.Printf("  ℹ Logging in to gcloud as '%s'...\n", requiredAccount)
+	if err := runGcloudCommand("auth", "login", requiredAccount); err != nil {
+		fmt.Printf("  ✗ gcloud login failed for '%s': %v\n", requiredAccount, err)
+		return false
+	}
+	if err := runGcloudCommand("config", "set", "account", requiredAccount); err != nil {
+		fmt.Printf("  ✗ Failed to set gcloud account after login: %v\n", err)
+		return false
+	}
+	return true
+}
+
+func runGcloudCommand(args ...string) error {
+	cmd := exec.Command("gcloud", args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func runGcloudValueCommand(args ...string) (string, error) {
+	cmd := exec.Command("gcloud", args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 // ─── Platform-specific helpers ───────────────────────────────────────────────
@@ -480,25 +655,27 @@ func readLine(reader *bufio.Reader) string {
 
 func printHelp() {
 	fmt.Println(`
-GCP SSH-in-Browser Launcher
-============================
+GCP SSH Launcher (Browser + Terminal)
+=====================================
 
 Usage:
-  gcp-ssh                              Interactive mode
-  gcp-ssh <alias>                      Connect to saved instance by alias
-  gcp-ssh connect <alias>              Connect to saved instance by alias
-  gcp-ssh quick <project> <zone> <vm>  One-off quick connect
-  gcp-ssh add                          Add a new saved instance
-  gcp-ssh list                         List saved instances
-  gcp-ssh remove <alias>               Remove a saved instance
-  gcp-ssh profile                      Change Chrome profile
-  gcp-ssh help                         Show this help
+  gcp-ssh                                   Interactive mode
+  gcp-ssh <alias>                           Connect to saved instance by alias
+  gcp-ssh connect <alias>                   Connect to saved instance by alias
+  gcp-ssh connect-terminal <alias>          Force terminal SSH mode for alias
+  gcp-ssh quick <project> <zone> <vm> [acc] One-off quick connect in browser mode
+  gcp-ssh quick-terminal <project> <zone> <vm> [acc]
+                                            One-off quick connect in terminal mode
+  gcp-ssh add                               Add a new saved instance
+  gcp-ssh list                              List saved instances
+  gcp-ssh remove <alias>                    Remove a saved instance
+  gcp-ssh profile                           Change Chrome profile
+  gcp-ssh help                              Show this help
 
-Examples:
-  gcp-ssh quick my-project us-central1-a my-vm
-  gcp-ssh add
-  gcp-ssh my-server
-  gcp-ssh connect dev-box
+Before SSH, the tool now:
+  1) verifies gcloud CLI is installed,
+  2) verifies/sets the expected gcloud account,
+  3) checks and starts the instance if not running.
 
 Config is stored at: ~/.gcp-ssh/config.json`)
 }
